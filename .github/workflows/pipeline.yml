@@ -91,6 +91,8 @@ jobs:
       - run: uv sync --dev
 
       - name: 🧪 Ejecutar tests unitarios TDD con cobertura
+        # --cov sin --cov-fail-under: reporte informativo.
+        # El umbral del 80% lo impone suite-completa (todos los tests juntos).
         run: |
           mkdir -p reports
           uv run pytest tests/test_carrito.py \
@@ -98,7 +100,6 @@ jobs:
             --cov-report=xml:reports/coverage_unit.xml \
             --cov-report=html:reports/htmlcov \
             --cov-report=term-missing \
-            --cov-fail-under=${{ env.MIN_COVERAGE }} \
             -v \
             --tb=short
 

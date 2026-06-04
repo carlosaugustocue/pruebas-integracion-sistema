@@ -40,7 +40,6 @@ omit = ["*/__init__.py"]
 
 [tool.coverage.report]
 show_missing = true
-fail_under = 80
 exclude_lines = [
     "if __name__ == '__main__':",
     "def __repr__",

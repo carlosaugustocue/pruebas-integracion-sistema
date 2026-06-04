@@ -1,86 +1,107 @@
-# ================================================================
-# PIPELINE CI/CD COMPLETO — TiendaUV
-# ================================================================
-# Integra todas las pruebas del proyecto:
-#   ✅ Calidad de código (ruff lint + format)
-#   ✅ Tests unitarios TDD — tests/test_carrito.py
-#   ✅ Tests de aceptación BDD — tests/features/
-#   ✅ Tests funcionales (equivalencia, límites, tablas, estados)
-#   ✅ Tests de seguridad OWASP — tests/security/
-#   ✅ Suite completa con cobertura unificada
-#   ✅ Tests de rendimiento Locust (solo en push a main)
+# Pipeline CI/CD completo para el proyecto carrito-compras (TiendaUV).
 #
-# Diagrama de dependencias:
+# Orden de ejecucion de los jobs:
+#
 #   codigo-quality
-#        │
-#        ▼
+#        |
+#        v
 #   tests-unitarios
-#        │
-#        ├──────────────────────┬──────────────────────┐
-#        ▼                      ▼                      ▼
+#        |
+#        +----------------------+----------------------+
+#        v                      v                      v
 #   tests-aceptacion-bdd  tests-funcionales    tests-seguridad
-#        │                      │                      │
-#        └──────────────────────┴──────────────────────┘
-#                               │
-#                               ▼
-#                         suite-completa
-#                               │
-#                               ▼
-#                        tests-rendimiento
-#                       (solo push a main)
-# ================================================================
+#        |                      |                      |
+#        +----------------------+----------------------+
+#                               |
+#                               v
+#                         suite-completa   <-- aqui se impone la cobertura minima 80%
+#                               |
+#                               v
+#                        tests-rendimiento  (solo en push a main)
+#
+# Por que este orden?
+#   - Los tests unitarios son los mas rapidos y detectan errores de logica basica.
+#     No tiene sentido correr BDD, funcionales o seguridad si el nucleo esta roto.
+#   - BDD, funcionales y seguridad corren en paralelo para reducir el tiempo total.
+#   - Suite-completa es la compuerta final: todos los tests juntos con cobertura unificada.
+#   - Los tests de rendimiento (Locust) solo corren en main porque levantan la API
+#     real y toman 30+ segundos; correrlos en cada PR enlenteceria demasiado el ciclo.
 
 name: Pipeline CI/CD TiendaUV
 
-# ── Triggers ─────────────────────────────────────────────────────
+# Triggers: cuando se activa este pipeline.
+# - push a main o develop: corre todo el pipeline incluyendo rendimiento en main.
+# - pull_request a main: corre hasta suite-completa (sin rendimiento).
+# - workflow_dispatch: permite lanzarlo manualmente desde la UI de GitHub,
+#   util para depurar o reejecutar sin hacer un nuevo commit.
 on:
   push:
     branches: [main, develop]
   pull_request:
     branches: [main]
-  workflow_dispatch: # Permite ejecución manual desde la UI de GitHub
+  workflow_dispatch:
 
-# ── Variables globales ───────────────────────────────────────────
+# Variables de entorno disponibles en todos los jobs.
+# Centralizar estos valores aqui evita repetirlos en cada step y facilita cambiarlos.
 env:
   PYTHON_VERSION: "3.12"
-  MIN_COVERAGE: "80" # Cobertura mínima aceptable (%)
+  MIN_COVERAGE: "80"
 
-# ================================================================
-# JOB 1: Calidad de código
-# Analiza el código antes de correr cualquier test.
-# ================================================================
+# =============================================================================
+# JOB 1: Calidad de codigo
+#
+# Verifica que el codigo cumpla las reglas de estilo antes de correr cualquier
+# test. Si hay errores de lint o formato, no tiene sentido gastar tiempo en tests.
+#
+# Herramienta: ruff (linter y formatter escrito en Rust, mucho mas rapido que flake8+black).
+# - ruff check: detecta errores de logica, imports sin usar, variables sin usar, etc.
+# - ruff format: verifica que el formato sea consistente (equivalente a black).
+# =============================================================================
 jobs:
   codigo-quality:
-    name: 🔍 Calidad de Código
+    name: Calidad de Codigo
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout del repositorio
+      - name: Checkout del repositorio
         uses: actions/checkout@v4
 
-      - name: ⚡ Instalar uv
+      # setup-uv instala el gestor de paquetes uv, que es significativamente
+      # mas rapido que pip para instalar dependencias en CI.
+      - name: Instalar uv
         uses: astral-sh/setup-uv@v4
         with:
           version: "latest"
 
-      - name: 🐍 Configurar Python
+      - name: Configurar Python
         run: uv python install ${{ env.PYTHON_VERSION }}
 
-      - name: 📦 Instalar dependencias
+      # --dev instala tambien las dependencias de desarrollo (pytest, ruff, locust, etc.)
+      - name: Instalar dependencias
         run: uv sync --dev
 
-      - name: 🎨 Verificar lint con ruff
+      # --output-format=github hace que los errores aparezcan como anotaciones
+      # directamente en el diff del Pull Request, no solo en los logs.
+      - name: Verificar lint con ruff
         run: uv run ruff check src/ tests/ --output-format=github
 
-      - name: 🔤 Verificar formato con ruff
+      # --check solo verifica sin modificar archivos. Si hay diferencias, falla.
+      # Para formatear localmente: uv run ruff format src/ tests/
+      - name: Verificar formato con ruff
         run: uv run ruff format --check src/ tests/
 
-# ================================================================
-# JOB 2: Tests unitarios TDD + cobertura
-# Los tests más rápidos van primero.
-# ================================================================
+# =============================================================================
+# JOB 2: Tests unitarios TDD
+#
+# Corre los 21 tests de tests/test_carrito.py, que cubren la logica de negocio
+# del carrito (agregar, eliminar, calcular, descuentos, stock, IVA, vaciar).
+#
+# Genera un reporte de cobertura XML e HTML que se guarda como artifact.
+# No se impone un umbral aqui porque este job solo corre una parte de los tests;
+# el umbral del 80% se impone en suite-completa con todos los tests juntos.
+# =============================================================================
   tests-unitarios:
-    name: 🟢 Tests Unitarios TDD
+    name: Tests Unitarios TDD
     runs-on: ubuntu-latest
     needs: codigo-quality
 
@@ -90,9 +111,7 @@ jobs:
       - run: uv python install ${{ env.PYTHON_VERSION }}
       - run: uv sync --dev
 
-      - name: 🧪 Ejecutar tests unitarios TDD con cobertura
-        # --cov sin --cov-fail-under: reporte informativo.
-        # El umbral del 80% lo impone suite-completa (todos los tests juntos).
+      - name: Ejecutar tests unitarios TDD
         run: |
           mkdir -p reports
           uv run pytest tests/test_carrito.py \
@@ -103,7 +122,9 @@ jobs:
             -v \
             --tb=short
 
-      - name: 📊 Publicar reporte de cobertura
+      # if: always() garantiza que el artifact se sube incluso si el job fallo,
+      # lo que permite revisar el reporte cuando hay errores de cobertura.
+      - name: Publicar reporte de cobertura
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -111,12 +132,22 @@ jobs:
           path: reports/
           retention-days: 7
 
-# ================================================================
-# JOB 3: Tests de aceptación BDD
-# Valida el comportamiento desde la perspectiva del negocio.
-# ================================================================
+# =============================================================================
+# JOB 3: Tests de aceptacion BDD
+#
+# Corre los 12 scenarios de tests/features/carrito.feature escritos en Gherkin.
+# Estos tests validan el comportamiento desde la perspectiva del negocio y del
+# usuario final, no desde la perspectiva tecnica.
+#
+# Se ejecutan en dos pasadas:
+#   1. Todos los scenarios (smoke + critical + regression).
+#   2. Solo los marcados con @smoke: los mas criticos. Si esta pasada falla,
+#      significa que algo fundamental del sistema esta roto.
+#
+# Corre en paralelo con tests-funcionales y tests-seguridad.
+# =============================================================================
   tests-aceptacion-bdd:
-    name: 🎭 Tests de Aceptación BDD
+    name: Tests de Aceptacion BDD
     runs-on: ubuntu-latest
     needs: tests-unitarios
 
@@ -126,27 +157,39 @@ jobs:
       - run: uv python install ${{ env.PYTHON_VERSION }}
       - run: uv sync --dev
 
-      - name: 🥒 Ejecutar todos los scenarios BDD
+      - name: Ejecutar todos los scenarios BDD
         run: |
           uv run pytest tests/features/ \
             -v \
             --tb=short \
             -m "smoke or critical or regression"
 
-      - name: 💨 Verificar subset crítico (@smoke)
+      # Segunda pasada solo con @smoke para detectar rapidamente fallos criticos.
+      # Si los smoke tests pasan pero alguno de regression falla, el problema
+      # es mas sutil y no bloquea el deploy inmediatamente.
+      - name: Verificar subset critico con marca smoke
         run: |
           uv run pytest tests/features/ \
             -v \
             -m smoke \
             --tb=short
 
-# ================================================================
-# JOB 4: Tests funcionales con técnicas de diseño
-# Equivalencia, límites, tablas de decisión, transición de estados.
-# Corre en paralelo con BDD y seguridad.
-# ================================================================
+# =============================================================================
+# JOB 4: Tests funcionales con tecnicas de diseno
+#
+# Corre los tests que aplican las tecnicas sistematicas de la Semana 5:
+#   - Particion de equivalencia: tests/test_funcional.py (clases TestParticion*)
+#   - Analisis de valores limite: tests/test_funcional.py (clases TestValoresLimite*)
+#   - Transicion de estados: tests/test_funcional.py (clases TestTransicion*)
+#   - Tabla de decision: tests/test_tabla_decision.py
+#
+# Se ejecutan en tres pasadas por tecnica para que los logs sean claros
+# cuando falla algo. La cuarta pasada genera el reporte de cobertura.
+#
+# Corre en paralelo con tests-aceptacion-bdd y tests-seguridad.
+# =============================================================================
   tests-funcionales:
-    name: 🎯 Tests Funcionales
+    name: Tests Funcionales
     runs-on: ubuntu-latest
     needs: tests-unitarios
 
@@ -156,24 +199,26 @@ jobs:
       - run: uv python install ${{ env.PYTHON_VERSION }}
       - run: uv sync --dev
 
-      - name: ✂️ Partición de equivalencia y valores límite
+      # -k filtra tests por nombre. Cubre tanto las clases (TestParticion*)
+      # como las funciones parametrizadas (test_particion_*).
+      - name: Particion de equivalencia y valores limite
         run: |
           uv run pytest tests/test_funcional.py \
             -v --tb=short \
             -k "Particion or Limite or limite or particion"
 
-      - name: 📊 Tabla de decisión
+      - name: Tabla de decision
         run: |
           uv run pytest tests/test_tabla_decision.py \
             -v --tb=short
 
-      - name: 🔄 Transición de estados
+      - name: Transicion de estados
         run: |
           uv run pytest tests/test_funcional.py \
             -v --tb=short \
             -k "Transicion or transicion"
 
-      - name: 🎯 Suite funcional completa con cobertura
+      - name: Suite funcional completa con cobertura
         run: |
           mkdir -p reports
           uv run pytest \
@@ -183,19 +228,32 @@ jobs:
             --cov=src \
             --cov-report=xml:reports/coverage_functional.xml
 
-      - name: 📤 Publicar reporte funcional
+      - name: Publicar reporte funcional
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: coverage-funcional
           path: reports/
 
-# ================================================================
+# =============================================================================
 # JOB 5: Tests de seguridad OWASP
-# Corre en paralelo con funcionales y BDD.
-# ================================================================
+#
+# Corre los 11 tests de tests/security/test_seguridad_api.py, basados en el
+# OWASP API Security Top 10 (2023). Verifican que la API no sea vulnerable a:
+#   - SQL Injection y XSS (API8)
+#   - Tipos de datos incorrectos y mass assignment (API8)
+#   - Payloads gigantes que puedan causar DoS (API4)
+#   - Cabeceras que revelan informacion interna del servidor (API8)
+#
+# Ademas ejecuta pip-audit para detectar CVEs conocidos en las dependencias.
+# pip-audit no falla el pipeline si encuentra vulnerabilidades (|| true) porque
+# puede haber falsos positivos o vulnerabilidades sin parche disponible; el
+# reporte queda guardado como artifact para revision manual.
+#
+# Corre en paralelo con tests-aceptacion-bdd y tests-funcionales.
+# =============================================================================
   tests-seguridad:
-    name: 🔐 Tests de Seguridad OWASP
+    name: Tests de Seguridad OWASP
     runs-on: ubuntu-latest
     needs: tests-unitarios
 
@@ -205,32 +263,45 @@ jobs:
       - run: uv python install ${{ env.PYTHON_VERSION }}
       - run: uv sync --dev
 
-      - name: 🛡️ Ejecutar tests de seguridad OWASP
+      - name: Ejecutar tests de seguridad OWASP
         run: |
           uv run pytest tests/security/ \
             -v --tb=short
 
-      - name: 📦 Auditar vulnerabilidades en dependencias
+      - name: Auditar vulnerabilidades en dependencias con pip-audit
         run: |
           mkdir -p reports
           uv add --dev pip-audit
           uv run pip-audit --format=json > reports/security_audit.json || true
-          uv run pip-audit || echo "⚠️ Revisar vulnerabilidades en dependencias"
+          uv run pip-audit || echo "Revisar vulnerabilidades en dependencias (ver artifact security-report)"
 
-      - name: 📤 Guardar reporte de seguridad
+      - name: Guardar reporte de auditoria de seguridad
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: security-report
           path: reports/security_audit.json
 
-# ================================================================
-# JOB 6: Suite completa integrada (89 tests)
-# Espera a que BDD, funcionales y seguridad hayan pasado.
-# Genera el reporte de cobertura unificado.
-# ================================================================
+# =============================================================================
+# JOB 6: Suite completa integrada
+#
+# Este job es la compuerta de calidad final. Solo corre cuando los tres jobs
+# paralelos (BDD, funcionales, seguridad) han pasado exitosamente.
+#
+# Corre los 89 tests juntos y mide la cobertura unificada. Si la cobertura
+# total del proyecto es menor al 80% (MIN_COVERAGE), el pipeline falla aqui
+# y el codigo no puede llegar a produccion.
+#
+# Genera tres reportes:
+#   - XML: para integracion con herramientas externas (CodeCov, SonarQube).
+#   - HTML: reporte navegable que muestra exactamente que lineas no estan cubiertas.
+#   - JUnit XML: formato estandar de resultados, legible por GitHub Actions
+#     y por otras herramientas de CI (Jenkins, CircleCI, etc.).
+#
+# En Pull Requests, publica un comentario automatico con el resultado.
+# =============================================================================
   suite-completa:
-    name: 🧩 Suite Completa Integrada
+    name: Suite Completa Integrada
     runs-on: ubuntu-latest
     needs:
       - tests-aceptacion-bdd
@@ -243,7 +314,7 @@ jobs:
       - run: uv python install ${{ env.PYTHON_VERSION }}
       - run: uv sync --dev
 
-      - name: 🚀 Ejecutar suite completa (89 tests)
+      - name: Ejecutar suite completa con cobertura unificada
         run: |
           mkdir -p reports
           uv run pytest \
@@ -260,14 +331,18 @@ jobs:
             -v --tb=short \
             --junit-xml=reports/test_results.xml
 
-      - name: 📊 Publicar reporte unificado
+      # retention-days: 30 porque este es el reporte definitivo del sprint.
+      # Los reportes de jobs individuales se guardan solo 7 dias.
+      - name: Publicar reporte unificado
         uses: actions/upload-artifact@v4
         with:
           name: suite-completa-reporte
           path: reports/
           retention-days: 30
 
-      - name: 📋 Comentar resultado en Pull Request
+      # Comenta el resultado directamente en el Pull Request para que el revisor
+      # vea el estado sin tener que abrir la pestana Actions.
+      - name: Comentar resultado en Pull Request
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
@@ -276,16 +351,30 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: '✅ **Suite completa pasó** — 89 tests, cobertura ≥ 80%'
+              body: '**Suite completa paso** - 89 tests, cobertura mayor o igual al 80%'
             })
 
-# ================================================================
+# =============================================================================
 # JOB 7: Tests de rendimiento con Locust
-# Solo corre en push a main (no en cada PR — sería demasiado lento).
-# Levanta la API, corre 30 segundos de carga y verifica los SLAs.
-# ================================================================
+#
+# Levanta la API REST (src/carrito/api.py) en background, espera que arranque,
+# lanza 50 usuarios virtuales durante 30 segundos con Locust y luego verifica
+# que se cumplan los SLAs definidos:
+#   - P95 (percentil 95 de tiempo de respuesta) menor a 500ms.
+#   - Tasa de error (respuestas != 2xx) menor al 1%.
+#
+# Por que solo en push a main y no en cada PR?
+#   - Las pruebas de carga toman minimo 30 segundos mas el tiempo de arranque.
+#   - Correrlas en cada PR aumentaria el tiempo del pipeline de ~3 min a ~5 min,
+#     lo que desincentiva hacer PRs pequenos y frecuentes.
+#   - Los bugs de rendimiento rara vez se introducen en un solo commit;
+#     es mas util detectarlos en la rama principal despues de la integracion.
+#
+# if: always() en "Detener la API" garantiza que el proceso uvicorn se mata
+# incluso si Locust falla, evitando procesos huerfanos en el runner.
+# =============================================================================
   tests-rendimiento:
-    name: ⚡ Tests de Rendimiento (Locust)
+    name: Tests de Rendimiento Locust
     runs-on: ubuntu-latest
     needs: suite-completa
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -296,7 +385,9 @@ jobs:
       - run: uv python install ${{ env.PYTHON_VERSION }}
       - run: uv sync --dev
 
-      - name: 🚀 Levantar la API en background
+      # Arranca uvicorn en segundo plano y guarda el PID para poder matarlo
+      # al final. sleep 5 da tiempo a que la API este lista para recibir peticiones.
+      - name: Levantar la API en background
         run: |
           uv run uvicorn src.carrito.api:app \
             --host 0.0.0.0 \
@@ -304,13 +395,21 @@ jobs:
           echo $! > /tmp/api.pid
           sleep 5
 
-      - name: ✅ Verificar que la API responde
+      # Verifica que la API realmente arranc antes de lanzar la carga.
+      # Si este step falla, el pipeline falla con un mensaje claro en lugar de
+      # que Locust falle con errores de conexion dificiles de interpretar.
+      - name: Verificar que la API responde
         run: |
           curl -f http://localhost:8000/carrito/health-check \
-            || (echo "❌ La API no responde" && exit 1)
-          echo "✅ API lista para recibir carga"
+            || (echo "La API no responde en el puerto 8000" && exit 1)
+          echo "API lista para recibir carga"
 
-      - name: 🦗 Ejecutar prueba de carga (30 segundos, 50 usuarios)
+      # --users 50: numero maximo de usuarios virtuales concurrentes.
+      # --spawn-rate 10: usuarios nuevos por segundo durante el arranque (0 a 50 en 5s).
+      # --run-time 30s: duracion total de la prueba.
+      # --exit-code-on-error 1: si Locust detecta errores HTTP, falla el step.
+      # --csv: genera resultados en formato CSV para el script de verificacion de SLAs.
+      - name: Ejecutar prueba de carga con Locust
         run: |
           mkdir -p reports/locust
           uv run locust \
@@ -324,7 +423,11 @@ jobs:
             --html reports/locust/reporte.html \
             --exit-code-on-error 1
 
-      - name: 📉 Verificar SLAs de rendimiento
+      # Lee el CSV que genera Locust (resultados_stats.csv) y verifica los SLAs.
+      # La fila "Aggregated" contiene los numeros consolidados de todas las rutas.
+      # El script sale con codigo 1 si se viola alguno de los dos SLAs,
+      # lo que hace que el job falle y bloquea el pipeline.
+      - name: Verificar SLAs de rendimiento
         run: |
           python3 - <<'EOF'
           import csv, sys
@@ -336,28 +439,30 @@ jobs:
                       p95 = float(row['95%'])
                       failure_rate = float(row['Failure Count']) / max(float(row['Request Count']), 1)
 
-                      print(f"P95: {p95:.1f}ms  (máximo permitido: 500ms)")
-                      print(f"Error rate: {failure_rate:.2%}  (máximo permitido: 1%)")
+                      print(f"P95: {p95:.1f}ms  (maximo permitido: 500ms)")
+                      print(f"Error rate: {failure_rate:.2%}  (maximo permitido: 1%)")
 
                       if p95 > 500:
-                          print(f"❌ SLA VIOLADO: P95 {p95:.1f}ms > 500ms")
+                          print(f"SLA VIOLADO: P95 {p95:.1f}ms supera el limite de 500ms")
                           sys.exit(1)
 
                       if failure_rate > 0.01:
-                          print(f"❌ SLA VIOLADO: Error rate {failure_rate:.2%} > 1%")
+                          print(f"SLA VIOLADO: Error rate {failure_rate:.2%} supera el limite del 1%")
                           sys.exit(1)
 
-                      print("✅ Todos los SLAs cumplidos")
+                      print("Todos los SLAs cumplidos")
           EOF
 
-      - name: 🛑 Detener la API
+      # if: always() para que siempre se mate el proceso uvicorn,
+      # incluso si Locust o la verificacion de SLAs fallaron.
+      - name: Detener la API
         if: always()
         run: |
           if [ -f /tmp/api.pid ]; then
             kill $(cat /tmp/api.pid) 2>/dev/null || true
           fi
 
-      - name: 📤 Guardar reporte de Locust
+      - name: Guardar reporte de Locust
         uses: actions/upload-artifact@v4
         if: always()
         with:

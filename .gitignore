@@ -1,0 +1,44 @@
+# ── Entorno virtual ───────────────────────────────────────────────
+.venv/
+
+# ── Python: bytecode y caché ──────────────────────────────────────
+__pycache__/
+*.py[oc]
+*.pyd
+
+# ── Empaquetado / distribución ────────────────────────────────────
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# ── Cobertura de código ───────────────────────────────────────────
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# ── Reportes generados por el pipeline ───────────────────────────
+reports/
+
+# ── Caché de herramientas ─────────────────────────────────────────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ── Variables de entorno y secretos ──────────────────────────────
+.env
+.env.*
+*.env
+
+# ── IDEs y editores ───────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Sistema operativo ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db

@@ -6,24 +6,20 @@ Ejecutar:
     uv run uvicorn src.carrito.api:app --port 8000 --reload
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from src.carrito.carrito import Carrito
+from src.database.config import get_db, init_db
+from src.database.repositorio import CarritoRepositorio
 
-app = FastAPI(title="TiendaUV — Carrito API", version="1.0.0")
-
-# Almacenamiento en memoria: sesion_id → Carrito
-_carritos: dict[str, Carrito] = {}
-
-
-def _get_or_create(sesion_id: str) -> Carrito:
-    if sesion_id not in _carritos:
-        _carritos[sesion_id] = Carrito()
-    return _carritos[sesion_id]
+app = FastAPI(title="TiendaUV - Carrito API", version="1.0.0")
 
 
-# ── Modelos de entrada (Pydantic valida tipos automáticamente) ────────
+@app.on_event("startup")
+def on_startup() -> None:
+    # Garantiza tablas en PostgreSQL. En SQLite ya se crean al importar config.
+    init_db()
 
 
 class ProductoInput(BaseModel):
@@ -37,46 +33,46 @@ class DescuentoInput(BaseModel):
     valor: float
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────
-
-
 @app.get("/carrito/health-check")
 def health_check():
     return {"status": "ok"}
 
 
 @app.post("/carrito/{sesion_id}/productos", status_code=201)
-def agregar_producto(sesion_id: str, producto: ProductoInput):
-    carrito = _get_or_create(sesion_id)
+def agregar_producto(sesion_id: str, producto: ProductoInput, db: Session = Depends(get_db)):
+    repo = CarritoRepositorio(db)
     try:
-        carrito.agregar_producto(producto.nombre, producto.precio, producto.cantidad)
+        repo.agregar_item(sesion_id, producto.nombre, producto.precio, producto.cantidad)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     return {"mensaje": f"Producto '{producto.nombre}' agregado al carrito"}
 
 
 @app.get("/carrito/{sesion_id}")
-def obtener_carrito(sesion_id: str):
-    carrito = _get_or_create(sesion_id)
+def obtener_carrito(sesion_id: str, db: Session = Depends(get_db)):
+    repo = CarritoRepositorio(db)
+    productos = repo.obtener_productos(sesion_id)
     return {
         "sesion_id": sesion_id,
-        "productos": carrito.obtener_productos(),
-        "total": carrito.calcular_total(),
+        "productos": productos,
+        "total": repo.calcular_total(sesion_id),
+        "total_con_iva": repo.calcular_total_con_iva(sesion_id),
+        "cantidad_productos": len(productos),
     }
 
 
 @app.post("/carrito/{sesion_id}/descuento")
-def aplicar_descuento(sesion_id: str, descuento: DescuentoInput):
-    carrito = _get_or_create(sesion_id)
+def aplicar_descuento(sesion_id: str, descuento: DescuentoInput, db: Session = Depends(get_db)):
+    repo = CarritoRepositorio(db)
     try:
-        carrito.aplicar_descuento(descuento.tipo, descuento.valor)
+        repo.aplicar_descuento(sesion_id, descuento.tipo, descuento.valor)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return {"mensaje": "Descuento aplicado", "total": carrito.calcular_total()}
+    return {"mensaje": "Descuento aplicado", "total": repo.calcular_total(sesion_id)}
 
 
 @app.delete("/carrito/{sesion_id}")
-def vaciar_carrito(sesion_id: str):
-    if sesion_id in _carritos:
-        _carritos[sesion_id].vaciar()
+def vaciar_carrito(sesion_id: str, db: Session = Depends(get_db)):
+    repo = CarritoRepositorio(db)
+    repo.vaciar(sesion_id)
     return {"mensaje": "Carrito vaciado"}

@@ -33,6 +33,10 @@ base de datos real y pipeline de CI/CD.
 22. [Cómo se conecta todo: trazabilidad completa de un test de integración](#22-cómo-se-conecta-todo-trazabilidad-completa-de-un-test-de-integración)
 23. [Comandos de referencia rápida](#23-comandos-de-referencia-rápida)
 24. [El pipeline de CI/CD](#24-el-pipeline-de-cicd)
+25. [Arquitectura de pytest: fixtures, recolección y ejecución](#25-arquitectura-de-pytest-fixtures-recolección-y-ejecución)
+26. [Por qué hay dos Dockerfiles y dos Docker Compose](#26-por-qué-hay-dos-dockerfiles-y-dos-docker-compose)
+27. [Cómo correr los tests dentro de un contenedor Docker](#27-cómo-correr-los-tests-dentro-de-un-contenedor-docker)
+28. [La pirámide de pruebas de este proyecto](#28-la-pirámide-de-pruebas-de-este-proyecto)
 
 ---
 
@@ -1885,3 +1889,282 @@ a ~6 minutos, lo que desincentiva hacer commits pequeños y frecuentes.
 - Corre Locust headless: 50 usuarios, 10 por segundo, durante 30 segundos
 - Si P95 > 500ms o error rate > 1%, el job falla y el commit queda rojo
 - Guarda el reporte HTML y los CSV de Locust como artefacto por 14 días
+
+---
+
+## 25. Arquitectura de pytest: fixtures, recolección y ejecución
+
+pytest es un **framework** de pruebas, no solo un runner que ejecuta funciones
+que empiecen con `test_`. Tiene cinco componentes bien definidos:
+
+### 1. Collector
+
+Escanea el sistema de archivos buscando archivos de test. El comportamiento
+lo controla `pyproject.toml`:
+
+```toml
+[tool.pytest.ini_options]
+testpaths = ["tests"]          # Buscar solo dentro de tests/
+python_files = ["test_*.py"]   # Archivos de test
+python_classes = ["Test*"]     # Clases dentro de esos archivos
+python_functions = ["test_*"]  # Funciones dentro de esos archivos o clases
+```
+
+Si un archivo se llama `test_carrito.py`, el collector lo abre. Si una función
+dentro se llama `test_agregar_un_producto`, la registra como test. Si la función
+se llama `helper_crear_carrito`, la ignora.
+
+### 2. Fixture engine
+
+El sistema nativo de pytest para preparar contexto antes de los tests. Los
+fixtures son parte del núcleo de pytest, no una librería externa. No necesitas
+importar nada para definirlos ni para usarlos:
+
+```python
+# Solo necesitas @pytest.fixture, que pytest provee en el módulo pytest
+@pytest.fixture
+def mi_fixture():
+    return algo_preparado()
+```
+
+```python
+# Y usar el nombre del fixture como parámetro del test
+def test_algo(mi_fixture):
+    assert mi_fixture.propiedad == valor_esperado
+```
+
+### 3. Dependency Injector
+
+Cuando pytest ve un test con parámetros, busca un fixture con ese nombre exacto
+en `conftest.py` y en los plugins instalados. Lo instancia y lo pasa como
+argumento. El matching es estrictamente por nombre de parámetro:
+
+```
+Parámetro del test: db_session → busca fixture llamado db_session
+Parámetro del test: client_con_bd → busca fixture llamado client_con_bd
+```
+
+No hay anotaciones de tipo, no hay imports, no hay configuración adicional.
+El nombre lo es todo.
+
+### 4. Runner
+
+Ejecuta los tests en el orden en que los recolectó. Gestiona el ciclo de vida
+de los fixtures (setup antes del test, teardown después). Captura las excepciones
+de los `assert` fallidos y las convierte en reportes de fallo. Reporta resultados
+en la terminal con colores y conteos.
+
+El flag `-v` en `addopts = "-v --tb=short"` de `pyproject.toml` hace que pytest
+imprima el nombre de cada test conforme lo ejecuta, en vez de solo un punto.
+
+### 5. Plugin system
+
+`pytest-bdd`, `pytest-cov`, `pytest-timeout` son plugins que extienden pytest.
+Se registran automáticamente al instalarse mediante el mecanismo de entry points
+de Python. No necesitas declarar los plugins en `pyproject.toml`: pytest los
+descubre solo buscando paquetes instalados que declaren el entry point
+`pytest11`.
+
+### El archivo conftest.py
+
+pytest busca `conftest.py` en la carpeta del test y en **todas las carpetas
+padre** hasta la raíz del proyecto. No lo importas; pytest lo encuentra solo.
+
+La jerarquía de conftest:
+```
+carrito-compras/
+├── conftest.py          ← disponible para TODOS los tests del proyecto
+└── tests/
+    ├── conftest.py      ← disponible para tests/ y subcarpetas (este proyecto usa este)
+    └── integration/
+        └── conftest.py  ← solo para tests/integration/ (no existe en este proyecto)
+```
+
+Un fixture definido en `tests/conftest.py` está disponible para:
+- `tests/test_carrito.py`
+- `tests/integration/test_repositorio_db.py`
+- `tests/system/test_sistema_e2e.py`
+- Cualquier archivo de test dentro de `tests/` o sus subcarpetas
+
+Sin necesidad de importar nada.
+
+---
+
+## 26. Por qué hay dos Dockerfiles y dos Docker Compose
+
+El principio es separación de responsabilidades: cada archivo tiene exactamente
+un propósito, y mezclarlo con otro propósito lo haría más complejo y frágil.
+
+### Los dos Dockerfiles
+
+**`Dockerfile` (producción)**
+
+- Contiene solo el código de producción: `src/`.
+- `uv sync --frozen --no-dev`: instala solo las dependencias de producción.
+  Sin pytest, ruff, testcontainers, locust, httpx.
+- La imagen resultante es más pequeña (~200MB) y más segura. Menos software
+  instalado significa menos superficie de ataque: no hay pytest ni ruff que
+  un atacante pueda usar si compromete el contenedor.
+- Se usa cuando: alguien despliega la API en un servidor real (producción, staging).
+
+**`Dockerfile.test` (tests en contenedor)**
+
+- Contiene todo el proyecto: `src/` + `tests/`.
+- `uv sync --frozen` (sin `--no-dev`): instala también pytest, ruff,
+  testcontainers, locust, httpx.
+- La imagen resultante es más grande (~400MB), pero nunca va a producción.
+- Se usa cuando: el pipeline de CI quiere correr los tests dentro de un
+  contenedor para garantizar que el entorno es idéntico al de cualquier
+  máquina.
+
+### Los dos Docker Compose
+
+**`docker-compose.yml` (desarrollo local)**
+
+Propósito: que el desarrollador trabaje con la API y la BD real en su máquina.
+
+Características:
+- PostgreSQL + API + Adminer (interfaz web de la BD).
+- Volumen persistente en disco: los datos sobreviven reinicios de contenedores.
+- API en puerto 8000 del host.
+- BD en puerto 5432 del host (accesible con psql o cualquier cliente).
+
+**`docker-compose.test.yml` (CI/CD y tests de sistema)**
+
+Propósito: entorno limpio y reproducible para los tests E2E y el pipeline.
+
+Características:
+- PostgreSQL + API. Sin Adminer (no se necesita en CI).
+- BD en `tmpfs` (RAM): los datos desaparecen cuando el contenedor para.
+  Garantiza estado limpio en cada ejecución del pipeline.
+- API en puerto 8001 del host (no colisiona con el de desarrollo si ambos están activos).
+- BD en puerto 5433 del host (no colisiona con el de desarrollo).
+
+### Cuándo usar cada uno
+
+| Situación | Comando |
+|---|---|
+| Desarrollar la API con BD real | `docker compose up -d` |
+| Ver qué hay en la BD via interfaz | `docker compose up -d` → Adminer en :8080 |
+| Tests unitarios / funcionales / seguridad | `uv run pytest tests/test_carrito.py ...` (sin Docker) |
+| Tests de integración | `uv run pytest tests/integration/` (TestContainers maneja Docker) |
+| Tests de sistema E2E | `docker compose -f docker-compose.test.yml up -d` → `pytest tests/system/` |
+| Simular el pipeline de CI localmente | `docker compose -f docker-compose.test.yml up -d` |
+
+---
+
+## 27. Cómo correr los tests dentro de un contenedor Docker
+
+A veces quieres correr los tests en exactamente el mismo entorno que el pipeline
+de CI/CD, sin depender de lo que tengas instalado en tu máquina. Para eso sirve
+`Dockerfile.test`.
+
+```bash
+# Construir la imagen de tests
+docker build -f Dockerfile.test -t tiendauv-tests .
+
+# Correr todos los tests dentro del contenedor
+# (excluye tests/system porque necesitan API externa, y tests/performance)
+docker run --rm tiendauv-tests
+
+# Correr solo una categoría
+docker run --rm tiendauv-tests uv run pytest tests/test_carrito.py -v
+
+# Correr con cobertura
+docker run --rm tiendauv-tests uv run pytest tests/test_carrito.py \
+  --cov=src --cov-report=term-missing
+
+# Para los tests de integración dentro del contenedor, Docker necesita
+# poder hablar con el daemon del host (Docker-in-Docker o DooD):
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  tiendauv-tests \
+  uv run pytest tests/integration/ -v -m integration
+```
+
+### Docker-in-Docker: cómo TestContainers funciona dentro de un contenedor
+
+Cuando TestContainers corre dentro de un contenedor Docker, necesita acceso
+al daemon de Docker del host para poder levantar el contenedor de PostgreSQL.
+Esto se logra montando el socket de Docker del host en el contenedor:
+
+```
+-v /var/run/docker.sock:/var/run/docker.sock
+```
+
+El socket Unix `/var/run/docker.sock` es la interfaz de comunicación con el
+daemon de Docker. Al montarlo, el contenedor de tests puede emitir comandos
+`docker run` que se ejecutan en el host, no dentro del contenedor. Esto se
+llama DooD (Docker-out-of-Docker).
+
+Esto es exactamente lo que hace GitHub Actions: el runner de `ubuntu-latest`
+tiene Docker instalado en el host. Los contenedores de TestContainers son
+levantados por el daemon del host, accesibles desde el runner y desde los
+contenedores que corran en él.
+
+---
+
+## 28. La pirámide de pruebas de este proyecto
+
+La pirámide de pruebas es un modelo que guía cuántas pruebas tener en cada
+nivel. La base es ancha (muchas pruebas rápidas) y la cima es estrecha (pocas
+pruebas lentas). La regla: mientras más arriba en la pirámide, más costoso
+es escribir, ejecutar y mantener el test.
+
+```
+                        /\
+                       /  \
+                      /    \
+                     / SIST.\   tests/system/  (6 tests)
+                    /  E2E   \  httpx contra API real en Docker
+                   /          \ Requiere: docker compose up
+                  /____________\
+                 /              \
+                / INTEGRACION    \ tests/integration/  (16 tests)
+               /  API + BD       \ TestClient + PostgreSQL real via TestContainers
+              /                   \ Requiere: Docker daemon disponible
+             /___________________/
+            /                    \
+           /  FUNCIONALES         \  tests/test_funcional.py      (29 tests)
+          /  SEGURIDAD             \ tests/test_tabla_decision.py (15 tests)
+         /  BDD                     \ tests/security/             (11 tests)
+        /  (API con SQLite en RAM)   \ tests/features/            (12 tests)
+       /______________________________\
+      /                               \
+     /    UNITARIOS TDD                \ tests/test_carrito.py  (21 tests)
+    /   (sin API, sin BD, solo Python) \ Solo logica pura en memoria
+   /___________________________________\
+```
+
+**Reglas de la pirámide:**
+
+- Mientras más abajo, más rápido, más barato y más numeroso debe ser.
+- Los tests unitarios son la base: decenas de tests en milisegundos.
+  Se corren en cada cambio, en cada commit, sin fricción.
+- Los tests de sistema son la cima: pocos tests, lentos, requieren infraestructura.
+  Se corren antes de cada despliegue para verificar el sistema completo.
+
+**Tiempos aproximados de ejecución en este proyecto:**
+
+| Nivel | Tests | Tiempo aproximado |
+|---|---|---|
+| Unitarios + funcionales + seguridad + BDD | 88 tests | 5-15 segundos |
+| Integración (con TestContainers) | 16 tests | 15-30 segundos |
+| Sistema E2E (con Docker Compose) | 6 tests | 10-20 segundos |
+| Rendimiento (Locust 30 segundos) | N/A | ~45 segundos |
+
+**El costo de subir vs bajar en la pirámide:**
+
+Si algo falla en un test de sistema E2E, tienes que:
+1. Investigar qué falla (puede ser la API, el repositorio, la BD, la red, el Docker).
+2. No puedes reproducirlo sin levantar Docker.
+3. El feedback loop es de minutos.
+
+Si algo falla en un test unitario, tienes que:
+1. Leer el nombre del test: te dice exactamente qué método y qué comportamiento.
+2. No necesitas Docker.
+3. El feedback loop es de segundos.
+
+Por eso la pirámide recomienda tener muchos tests unitarios y pocos de sistema.
+Los tests de sistema verifican que el despliegue funciona, no que el código es correcto.
+Los tests unitarios verifican que el código es correcto, sin depender del despliegue.

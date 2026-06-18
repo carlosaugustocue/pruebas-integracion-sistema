@@ -1070,7 +1070,270 @@ tiene gráficas de tiempo de respuesta y tasa de peticiones en el tiempo.
 
 ---
 
-## 22. Cómo se conecta todo: trazabilidad completa de un test de integración
+## 22. Qué es un fixture, qué significa lazy y cómo pytest inyecta parámetros
+
+Esta sección responde las preguntas: ¿qué es un fixture?, ¿qué significa que
+son lazy?, ¿cómo sabe pytest que le tiene que pasar `client_con_bd` y
+`db_session` a cada test?, ¿en qué momento exacto se ejecuta
+`TestAPIConBaseDeDatos`?
+
+---
+
+### ¿Qué es un fixture?
+
+Un fixture es una **función de preparación** que pytest ejecuta antes de un
+test para dejarle listo el contexto que necesita. Si un test necesita una
+conexión a la base de datos, no la crea él mismo; le pide a un fixture que
+se la prepare.
+
+Se define con el decorador `@pytest.fixture`:
+
+```python
+# tests/conftest.py
+
+@pytest.fixture(scope="function")
+def db_session(db_engine):
+    connection = db_engine.connect()
+    transaction = connection.begin()
+    Session = sessionmaker(bind=connection)
+    session = Session()
+    yield session          # <-- aquí el test recibe la sesión y corre
+    session.close()
+    transaction.rollback() # <-- esto se ejecuta después del test
+    connection.close()
+```
+
+El `yield` divide el fixture en dos partes:
+- **Todo lo que está antes del `yield`** es el **setup**: se ejecuta antes del test.
+- **El valor que se pone en el `yield`** es lo que el test recibe.
+- **Todo lo que está después del `yield`** es el **teardown**: se ejecuta después del test, pase o falle.
+
+Sin fixtures, cada test tendría que escribir su propio setup y teardown,
+y si el test falla antes del teardown, la BD queda sucia. El fixture garantiza
+que el teardown siempre corre.
+
+---
+
+### ¿Cómo sabe pytest qué fixture pasarle a cada test?
+
+Por **coincidencia de nombre**. Es la regla más importante de entender.
+
+Cuando pytest ve un test como este:
+
+```python
+def test_post_producto_persiste_en_bd(self, client_con_bd, db_session):
+    ...
+```
+
+Lee los nombres de los parámetros: `client_con_bd` y `db_session`.
+Busca en todos los `conftest.py` disponibles si existe un fixture que se
+llame exactamente igual. Si lo encuentra, lo ejecuta y pasa su valor como
+argumento.
+
+No es magia ni configuración especial. El nombre del parámetro en el test
+**debe ser idéntico** al nombre de la función del fixture. Si escribieras
+`def test_algo(self, sesion_bd)` y el fixture se llama `db_session`, pytest
+no lo encontraría y daría error.
+
+```
+Nombre del parámetro del test  ==  Nombre de la función @pytest.fixture
+         client_con_bd         ==  def client_con_bd(db_session):
+         db_session             ==  def db_session(db_engine):
+```
+
+pytest hace esto para todos los parámetros del test, de forma automática,
+sin que tengas que importar nada ni configurar nada.
+
+---
+
+### ¿Qué significa que los fixtures son "lazy"?
+
+Lazy (perezoso) significa que **un fixture no se ejecuta hasta que alguien
+lo pide**. pytest no ejecuta todos los fixtures al inicio; los instancia
+justo cuando el test que los necesita está a punto de correr.
+
+Ejemplo concreto: el fixture `postgres_container` levanta un contenedor Docker.
+Si corres solo los tests unitarios:
+
+```bash
+uv run pytest tests/test_carrito.py
+```
+
+...ningún test en `test_carrito.py` tiene un parámetro llamado `postgres_container`
+ni `db_session`. pytest registra los fixtures de `conftest.py` pero **nunca
+los ejecuta** porque nadie los pidió. Docker no se toca. El test va y viene
+en milisegundos.
+
+Si en cambio corres los tests de integración:
+
+```bash
+uv run pytest tests/integration/
+```
+
+Los tests de integración tienen parámetros `client_con_bd` y `db_session`.
+pytest sigue la cadena de dependencias y eventualmente necesita instanciar
+`postgres_container`. Ahí sí se ejecuta, y Docker arranca.
+
+```
+tests/test_carrito.py corre:
+    test_carrito_inicia_vacio()  → sin parámetros de BD → fixtures de BD NO se ejecutan
+
+tests/integration/ corre:
+    test_post_producto_persiste_en_bd(self, client_con_bd, db_session)
+        → pytest necesita client_con_bd
+            → client_con_bd necesita db_session
+                → db_session necesita db_engine
+                    → db_engine necesita postgres_container
+                        → postgres_container se ejecuta → Docker arranca
+```
+
+---
+
+### ¿Cuándo se ejecuta TestAPIConBaseDeDatos exactamente?
+
+`TestAPIConBaseDeDatos` es una **clase de test**. No es un fixture, no es
+especial, es solo una forma de agrupar tests relacionados. pytest la descubre
+porque su nombre empieza con `Test` (según la configuración `python_classes = ["Test*"]`
+en `pyproject.toml`).
+
+La secuencia exacta cuando corres `pytest tests/integration/`:
+
+```
+1. pytest escanea tests/integration/test_api_integracion.py
+2. Encuentra la clase TestAPIConBaseDeDatos
+3. Encuentra 6 métodos que empiezan con test_
+4. Los registra como 6 tests independientes
+5. Los corre uno por uno, en este orden:
+     - test_post_producto_persiste_en_bd
+     - test_get_carrito_lee_datos_reales_de_bd
+     - test_estado_persiste_entre_requests
+     - test_descuento_persiste_y_afecta_total
+     - test_vaciar_elimina_todo_de_bd
+     - test_estructura_respuesta_es_correcta
+```
+
+Antes de correr cada método, pytest analiza sus parámetros. El proceso
+para `test_post_producto_persiste_en_bd(self, client_con_bd, db_session)`:
+
+```
+pytest ve: necesito client_con_bd y db_session
+
+¿Tengo client_con_bd en los fixtures registrados? Sí, en conftest.py
+¿client_con_bd necesita algo? Sí, necesita db_session
+
+¿Tengo db_session en los fixtures registrados? Sí, en conftest.py
+¿db_session necesita algo? Sí, necesita db_engine
+
+¿Tengo db_engine en los fixtures registrados? Sí, en conftest.py
+¿db_engine necesita algo? Sí, necesita postgres_container
+
+¿Tengo postgres_container en los fixtures registrados? Sí, en conftest.py
+¿postgres_container necesita algo? No.
+¿Ya está instanciado? No (primera vez).
+→ EJECUTAR postgres_container → Docker arranca
+
+¿db_engine ya está instanciado? No (primera vez).
+→ EJECUTAR db_engine → CREATE TABLE
+
+¿db_session ya está instanciado? No (es scope=function, se crea por test).
+→ EJECUTAR db_session → BEGIN TRANSACTION
+
+¿client_con_bd ya está instanciado? No (es scope=function).
+→ EJECUTAR client_con_bd → dependency_overrides + TestClient
+
+Todo listo. pytest crea la instancia de TestAPIConBaseDeDatos y llama:
+    instancia.test_post_producto_persiste_en_bd(client_con_bd, db_session)
+```
+
+El parámetro `self` es la instancia de la clase, que pytest crea
+automáticamente. Los demás parámetros los resuelve con los fixtures.
+
+---
+
+### ¿Por qué los fixtures están en conftest.py y no en el mismo archivo de test?
+
+Un fixture definido en `conftest.py` está **disponible para todos los tests**
+dentro de esa carpeta y subcarpetas, sin necesidad de importarlo.
+
+Si pusiera los fixtures dentro de `test_api_integracion.py`, solo estarían
+disponibles para los tests de ese archivo. `test_repositorio_db.py` no podría
+usarlos. `conftest.py` es el mecanismo de pytest para compartir fixtures entre
+múltiples archivos de test.
+
+```
+tests/
+├── conftest.py                    ← fixtures disponibles para TODO tests/
+│                                     y sus subcarpetas
+├── integration/
+│   ├── test_repositorio_db.py     ← usa db_session de conftest.py
+│   └── test_api_integracion.py    ← usa client_con_bd y db_session de conftest.py
+└── system/
+    └── test_sistema_e2e.py        ← no usa ningún fixture de BD (son tests de sistema)
+```
+
+---
+
+### El scope de los fixtures controla cuántas veces se ejecutan
+
+`scope` define el ciclo de vida del fixture. Los valores posibles son:
+
+| scope | Cuándo se crea | Cuándo se destruye | Cuántas veces por ejecución |
+|-------|---------------|--------------------|-----------------------------|
+| `function` | Antes de cada test | Después de cada test | Una por test |
+| `class` | Antes del primer test de la clase | Después del último test de la clase | Una por clase |
+| `module` | Antes del primer test del archivo | Después del último test del archivo | Una por archivo |
+| `session` | Antes del primer test de toda la sesión | Al terminar pytest | Una sola vez |
+
+En este proyecto:
+- `postgres_container` → `scope="session"` → Docker arranca **una vez**. Los 16 tests de integración comparten el mismo contenedor.
+- `db_engine` → `scope="session"` → Las tablas se crean **una vez**.
+- `db_session` → `scope="function"` → Cada test tiene su propia transacción. 16 tests = 16 transacciones = 16 rollbacks.
+- `client_con_bd` → `scope="function"` → Cada test tiene su propio cliente con los overrides frescos.
+
+Si `db_session` fuera `scope="session"`, todos los tests compartirían la misma
+sesión y los datos de un test contaminarían el siguiente. El rollback por
+función es la clave del aislamiento.
+
+---
+
+### Resumen visual del momento exacto de cada ejecución
+
+```
+pytest tests/integration/ -v
+
+INICIO DE SESIÓN
+  → postgres_container  (scope=session): Docker run postgres:16-alpine
+  → db_engine           (scope=session): CREATE TABLE carritos, items_carrito
+
+TEST 1: test_crear_carrito_nuevo_en_bd
+  → db_session          (scope=function): BEGIN TRANSACTION
+  → el test corre
+  → db_session teardown: ROLLBACK, close connection
+
+TEST 2: test_obtener_carrito_existente_no_duplica
+  → db_session          (scope=function): nueva conexión, BEGIN TRANSACTION
+  → el test corre
+  → db_session teardown: ROLLBACK, close connection
+
+... (10 tests de test_repositorio_db.py)
+
+TEST 11: test_post_producto_persiste_en_bd
+  → db_session          (scope=function): nueva conexión, BEGIN TRANSACTION
+  → client_con_bd       (scope=function): dependency_overrides + TestClient
+  → el test corre (POST via TestClient → API → repositorio → db_session)
+  → client_con_bd teardown: dependency_overrides.clear()
+  → db_session teardown: ROLLBACK
+
+... (6 tests de test_api_integracion.py)
+
+FIN DE SESIÓN
+  → db_engine teardown:           DROP TABLE
+  → postgres_container teardown:  docker stop + docker rm
+```
+
+---
+
+## 23. Cómo se conecta todo: trazabilidad completa de un test de integración
 
 Esta sección responde exactamente: ¿qué archivo llama a qué cosa, quién activa
 TestContainers, de dónde viene `client_con_bd`, cómo llega la sesión de BD

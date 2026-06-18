@@ -57,6 +57,7 @@ el patron rollback para aislar cada test: el commit confirmaria los datos
 permanentemente y los tests se contaminarían entre si.
 """
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.database.models import CarritoDB, ItemCarritoDB
@@ -89,12 +90,37 @@ class CarritoRepositorio:
         # Buscar el carrito por sesion_id: SELECT * FROM carritos WHERE sesion_id = :id LIMIT 1
         carrito = self._session.query(CarritoDB).filter(CarritoDB.sesion_id == sesion_id).first()
         if carrito is None:
-            # No existe → crear uno nuevo
-            carrito = CarritoDB(sesion_id=sesion_id)
-            self._session.add(carrito)
-            # flush() envia el INSERT a la BD dentro de la transaccion.
-            # La BD asigna el id autoincremental. carrito.id ya tiene valor.
-            self._session.flush()
+            # No existe segun la lectura actual. Intentamos insertar.
+            #
+            # Problema de concurrencia (race condition):
+            # Con multiples requests paralelos para el mismo sesion_id, dos requests
+            # pueden llegar aqui al mismo tiempo y ambos ver carrito = None.
+            # Ambos intentan INSERT. El primero gana; el segundo falla con
+            # IntegrityError (UNIQUE constraint en sesion_id).
+            #
+            # Solucion: begin_nested() crea un SAVEPOINT en PostgreSQL.
+            # Un SAVEPOINT es un punto de restauracion dentro de la transaccion
+            # principal: si el INSERT falla, hacemos rollback solo hasta ese
+            # punto, sin deshacer todo el trabajo previo de la transaccion.
+            # Luego hacemos SELECT de nuevo para obtener el carrito que el
+            # otro request paralelo acabo de insertar.
+            #
+            # En SQLite (tests sin Docker) begin_nested() tambien funciona:
+            # SQLite soporta SAVEPOINTs desde la version 3.6.
+            savepoint = self._session.begin_nested()
+            try:
+                carrito = CarritoDB(sesion_id=sesion_id)
+                self._session.add(carrito)
+                self._session.flush()
+                savepoint.commit()
+            except IntegrityError:
+                # Otro request paralelo inserto el carrito antes que nosotros.
+                # Revertimos al SAVEPOINT (no a toda la transaccion) y buscamos
+                # el carrito que el otro request acaba de crear.
+                savepoint.rollback()
+                carrito = (
+                    self._session.query(CarritoDB).filter(CarritoDB.sesion_id == sesion_id).first()
+                )
         return carrito
 
     def agregar_item(

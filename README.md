@@ -30,8 +30,9 @@ base de datos real y pipeline de CI/CD.
 19. [Pruebas de integración con base de datos real](#19-pruebas-de-integración-con-base-de-datos-real)
 20. [Pruebas de sistema E2E](#20-pruebas-de-sistema-e2e)
 21. [Pruebas de rendimiento con Locust](#21-pruebas-de-rendimiento-con-locust)
-22. [Comandos de referencia rápida](#22-comandos-de-referencia-rápida)
-23. [El pipeline de CI/CD](#23-el-pipeline-de-cicd)
+22. [Cómo se conecta todo: trazabilidad completa de un test de integración](#22-cómo-se-conecta-todo-trazabilidad-completa-de-un-test-de-integración)
+23. [Comandos de referencia rápida](#23-comandos-de-referencia-rápida)
+24. [El pipeline de CI/CD](#24-el-pipeline-de-cicd)
 
 ---
 
@@ -1069,7 +1070,418 @@ tiene gráficas de tiempo de respuesta y tasa de peticiones en el tiempo.
 
 ---
 
-## 22. Comandos de referencia rápida
+## 22. Cómo se conecta todo: trazabilidad completa de un test de integración
+
+Esta sección responde exactamente: ¿qué archivo llama a qué cosa, quién activa
+TestContainers, de dónde viene `client_con_bd`, cómo llega la sesión de BD
+hasta el test?
+
+Se trazará paso a paso la ejecución de este test concreto:
+
+```python
+# tests/integration/test_api_integracion.py
+
+def test_post_producto_persiste_en_bd(self, client_con_bd, db_session):
+    client_con_bd.post(
+        "/carrito/api-1/productos",
+        json={"nombre": "Laptop", "precio": 2_500_000, "cantidad": 1},
+    )
+    item = (
+        db_session.query(ItemCarritoDB)
+        .join(CarritoDB)
+        .filter(CarritoDB.sesion_id == "api-1")
+        .first()
+    )
+    assert item is not None
+    assert item.nombre == "Laptop"
+```
+
+---
+
+### Paso 1 — Tú ejecutas el comando
+
+```bash
+uv run pytest tests/integration/ -v
+```
+
+pytest arranca. Lo primero que hace es **recolectar** todos los tests:
+lee todos los archivos `test_*.py` dentro de `tests/integration/` y
+los registra. Todavía no corre nada.
+
+---
+
+### Paso 2 — pytest lee tests/conftest.py
+
+Antes de correr cualquier test, pytest busca archivos `conftest.py` en la
+carpeta del test y en todas las carpetas padre. Encuentra:
+
+```
+tests/conftest.py
+```
+
+pytest registra los fixtures que están ahí definidos:
+`postgres_container`, `db_engine`, `db_session`, `client_con_bd`.
+Los registra pero **todavía no los ejecuta**. Los fixtures son lazy:
+solo se instancian cuando un test los pide.
+
+---
+
+### Paso 3 — pytest analiza las dependencias del test
+
+pytest ve que `test_post_producto_persiste_en_bd` necesita dos argumentos:
+`client_con_bd` y `db_session`. Los busca en los fixtures registrados y
+construye un árbol de dependencias:
+
+```
+test_post_producto_persiste_en_bd
+    ├── client_con_bd         (definido en tests/conftest.py)
+    │       └── db_session    (client_con_bd lo necesita)
+    │               └── db_engine   (db_session lo necesita)
+    │                       └── postgres_container  (db_engine lo necesita)
+    └── db_session            (el mismo que ya está en la cadena de arriba)
+```
+
+pytest resuelve los duplicados: `db_session` aparece dos veces pero es el
+mismo fixture, se instancia una sola vez por test.
+
+---
+
+### Paso 4 — pytest instancia postgres_container (AQUÍ arranca TestContainers)
+
+Es la primera vez en la sesión que un test pide `postgres_container`.
+Como tiene `scope="session"`, pytest lo instancia ahora y lo reutilizará
+para todos los tests de la sesión.
+
+```python
+# tests/conftest.py — línea 11-18
+
+@pytest.fixture(scope="session")
+def postgres_container():
+    from testcontainers.postgres import PostgresContainer  # se importa aquí
+
+    with PostgresContainer("postgres:16-alpine") as container:
+        yield container
+```
+
+`PostgresContainer("postgres:16-alpine")` le dice a TestContainers qué
+imagen usar. Al entrar en el bloque `with`, TestContainers hace internamente:
+
+```
+1. docker pull postgres:16-alpine   (si no está en caché local)
+2. docker run -d \
+     -e POSTGRES_DB=test \
+     -e POSTGRES_USER=test \
+     -e POSTGRES_PASSWORD=test \
+     -p {puerto_aleatorio}:5432 \
+     postgres:16-alpine
+3. Espera hasta que pg_isready responda (healthcheck interno)
+4. Retorna el objeto container con la URL de conexión
+```
+
+El puerto en el host es **aleatorio** (ejemplo: 49832). TestContainers
+lo elige para evitar conflictos con otros PostgreSQL que puedas tener corriendo.
+
+En este punto existe un proceso PostgreSQL real corriendo en tu máquina,
+dentro de un contenedor Docker, esperando conexiones en `localhost:49832`.
+
+El `yield container` pausa la ejecución del fixture y entrega el objeto
+`container` a quien lo pidió (el siguiente fixture en la cadena). El código
+después del `yield` (la destrucción del contenedor) solo corre cuando pytest
+termina toda la sesión.
+
+---
+
+### Paso 5 — pytest instancia db_engine
+
+```python
+# tests/conftest.py — línea 21-28
+
+@pytest.fixture(scope="session")
+def db_engine(postgres_container):
+    url = postgres_container.get_connection_url()
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    yield engine
+    Base.metadata.drop_all(engine)
+    engine.dispose()
+```
+
+`postgres_container.get_connection_url()` retorna algo como:
+```
+postgresql+psycopg2://test:test@localhost:49832/test
+```
+
+`create_engine(url)` crea el motor SQLAlchemy. No abre conexiones todavía;
+solo prepara la configuración de cómo conectarse.
+
+`Base.metadata.create_all(engine)` sí abre una conexión y ejecuta:
+```sql
+CREATE TABLE IF NOT EXISTS carritos (
+    id SERIAL PRIMARY KEY,
+    sesion_id VARCHAR(100) UNIQUE NOT NULL,
+    ...
+);
+CREATE TABLE IF NOT EXISTS items_carrito (
+    id SERIAL PRIMARY KEY,
+    carrito_id INTEGER REFERENCES carritos(id) ON DELETE CASCADE,
+    ...
+);
+```
+
+`Base` viene de `src/database/models.py`. El `metadata` contiene la
+definición de todas las tablas que heredan de `Base`. `create_all` lee
+esas definiciones y las traduce a SQL.
+
+También es `scope="session"`: las tablas se crean una vez y persisten
+para todos los tests. Se limpian con `drop_all` al final de la sesión.
+
+---
+
+### Paso 6 — pytest instancia db_session (una por test)
+
+```python
+# tests/conftest.py — línea 31-42
+
+@pytest.fixture(scope="function")
+def db_session(db_engine):
+    connection = db_engine.connect()
+    transaction = connection.begin()
+    Session = sessionmaker(bind=connection)
+    session = Session()
+    yield session
+    session.close()
+    transaction.rollback()
+    connection.close()
+```
+
+`scope="function"` significa que esto se ejecuta para cada test.
+
+`db_engine.connect()` abre una conexión real a PostgreSQL (el contenedor
+que levantamos en el paso 4).
+
+`connection.begin()` inicia una transacción en esa conexión. A partir de
+aquí, todo lo que haga sobre esa conexión está dentro de la transacción y
+puede deshacerse.
+
+`sessionmaker(bind=connection)` crea una fábrica de sesiones SQLAlchemy
+atada a esa conexión específica (no al engine general). Esto es importante:
+la sesión usará siempre esa misma conexión, con la transacción abierta.
+
+`Session()` crea la sesión. Es el objeto que se entrega al test como
+`db_session`.
+
+El `yield session` pausa el fixture y entrega la sesión. El test corre.
+Cuando el test termina (pase o falle), el código después del `yield` se ejecuta:
+`transaction.rollback()` deshace todo lo que hizo el test. La BD queda
+exactamente como estaba antes de que el test empezara.
+
+---
+
+### Paso 7 — pytest instancia client_con_bd
+
+```python
+# tests/conftest.py — línea 45-55
+
+@pytest.fixture(scope="function")
+def client_con_bd(db_session):
+    def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as client:
+        yield client
+    app.dependency_overrides.clear()
+```
+
+Este fixture necesita `db_session`, que pytest ya instanció en el paso 6.
+
+`get_db` es la función definida en `src/database/config.py`:
+
+```python
+# src/database/config.py
+
+def get_db():
+    db = SessionLocal()   # crea sesión nueva desde el pool
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+```
+
+Normalmente, cuando FastAPI recibe un request, llama a `get_db()` para
+obtener una sesión. Esa sesión viene de `SessionLocal`, que crea una conexión
+nueva y tiene su propia transacción separada.
+
+`app.dependency_overrides[get_db] = override_get_db` le dice a FastAPI:
+"cuando alguien pida `get_db`, en vez de llamar a la función original,
+llama a `override_get_db`". `override_get_db` retorna la `db_session` del test.
+
+El resultado: cuando la API procese el POST del test, obtendrá la misma
+sesión que el test tiene en `db_session`. Misma conexión. Misma transacción.
+
+`TestClient(app)` crea el cliente de pruebas de FastAPI/Starlette. Este
+cliente no abre un puerto de red. Llama a la app ASGI directamente en memoria,
+dentro del mismo proceso Python.
+
+---
+
+### Paso 8 — El test corre
+
+```python
+def test_post_producto_persiste_en_bd(self, client_con_bd, db_session):
+    client_con_bd.post(
+        "/carrito/api-1/productos",
+        json={"nombre": "Laptop", "precio": 2_500_000, "cantidad": 1},
+    )
+```
+
+`client_con_bd.post(...)` construye una petición HTTP sintética y la envía
+directamente a la app FastAPI en memoria. No hay socket. No hay TCP.
+
+FastAPI recibe la petición y la enruta al endpoint:
+
+```python
+# src/carrito/api.py
+
+@app.post("/carrito/{sesion_id}/productos", status_code=201)
+def agregar_producto(sesion_id: str, producto: ProductoInput, db: Session = Depends(get_db)):
+    repo = CarritoRepositorio(db)
+    ...
+```
+
+El `Depends(get_db)` normalmente llamaría a `get_db()` de `config.py`.
+Pero como aplicamos `dependency_overrides`, FastAPI llama a `override_get_db()`
+del conftest, que retorna la `db_session` del test.
+
+`CarritoRepositorio(db)` recibe esa sesión. Cuando llama a `session.flush()`,
+los SQL van a la conexión del test, dentro de su transacción abierta.
+
+```python
+    item = (
+        db_session.query(ItemCarritoDB)
+        .join(CarritoDB)
+        .filter(CarritoDB.sesion_id == "api-1")
+        .first()
+    )
+    assert item is not None
+```
+
+El test ahora consulta directamente en `db_session`. Como es la misma
+conexión que usó la API, el `SELECT` ve el item que se insertó con `flush()`,
+aunque no se haya hecho `commit()`. Dentro de la misma transacción, puedes
+leer tus propios cambios pendientes.
+
+---
+
+### Paso 9 — El test termina, el fixture limpia
+
+El test termina (pasó el assert). pytest vuelve al fixture `db_session`
+y ejecuta el código después del `yield`:
+
+```python
+    session.close()
+    transaction.rollback()   # ← deshace el INSERT que hizo el test
+    connection.close()
+```
+
+El `CarritoDB` y el `ItemCarritoDB` que insertó la API desaparecen de la BD.
+El siguiente test encontrará la base de datos exactamente vacía.
+
+También limpia `client_con_bd`:
+```python
+    app.dependency_overrides.clear()   # ← la API vuelve a usar get_db original
+```
+
+---
+
+### El mapa completo de archivos y su rol
+
+```
+uv run pytest tests/integration/
+        │
+        │ pytest lee
+        ▼
+tests/conftest.py               ← define los 4 fixtures
+        │
+        │ fixture postgres_container activa
+        ▼
+testcontainers (librería)       ← habla con Docker daemon
+        │
+        │ Docker levanta
+        ▼
+postgres:16-alpine (contenedor) ← BD real corriendo en localhost:XXXXX
+        │
+        │ fixture db_engine se conecta y ejecuta
+        ▼
+src/database/models.py          ← Base.metadata → CREATE TABLE
+        │
+        │ fixture db_session abre
+        ▼
+Transacción abierta en la BD    ← todo lo que haga el test va aquí
+        │
+        │ fixture client_con_bd registra
+        ▼
+app.dependency_overrides        ← FastAPI usará la sesión del test
+        │
+        │ el test llama
+        ▼
+TestClient(app)                 ← llamada en memoria, no hay red
+        │
+        │ FastAPI enruta al endpoint que llama
+        ▼
+src/database/repositorio.py     ← usa la sesión del test → INSERT
+        │
+        │ el test verifica con
+        ▼
+db_session.query(...)           ← misma sesión → ve el INSERT
+        │
+        │ test termina → fixture db_session ejecuta
+        ▼
+transaction.rollback()          ← el INSERT desaparece
+```
+
+---
+
+### Por qué los tests de sistema son distintos
+
+En los tests de sistema (`tests/system/test_sistema_e2e.py`) no hay
+`dependency_overrides`, no hay `conftest.py` con fixtures de BD, no hay
+TestContainers. Solo hay:
+
+```python
+httpx.Client(base_url="http://localhost:8001")
+```
+
+Eso es un cliente HTTP real que abre un socket TCP hacia el contenedor Docker
+donde corre la API. La API está en un proceso completamente separado con su
+propio `get_db`, su propia conexión a PostgreSQL, su propia transacción.
+El test no puede ver lo que hay en la BD a menos que lo pida a través de
+la API. No hay acceso interno.
+
+```
+test de sistema (tu proceso Python)
+    │
+    │  socket TCP → localhost:8001 → Docker container
+    ▼
+uvicorn en Docker               ← proceso separado, sin acceso desde el test
+    │
+    │  get_db() crea sesión nueva, commit al final del request
+    ▼
+PostgreSQL en Docker            ← proceso separado, solo accesible via API
+```
+
+Cuando el test hace `assert data["total"] == 2_670_000`, está verificando
+lo que la API retornó. No puede ir a verificar en la BD directamente porque
+la BD está dentro de Docker, en otro proceso. La única forma de saber si los
+datos se guardaron es pidiéndoselos a la API.
+
+---
+
+## 23. Comandos de referencia rápida
 
 ### Instalación
 ```bash
@@ -1157,7 +1569,7 @@ docker compose logs api-test -f
 
 ---
 
-## 23. El pipeline de CI/CD
+## 24. El pipeline de CI/CD
 
 El pipeline en `.github/workflows/pipeline.yml` corre automáticamente en
 cada `git push` a `main` o `develop`, y en cada Pull Request a `main`.
